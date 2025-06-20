@@ -1,4 +1,5 @@
 import pandas as pd
+import numpy as np
 from typing import List, Union, Tuple
 import spacy
 import logging
@@ -24,7 +25,7 @@ from edu_convokit.constants import (
     MATH_WORDS,
     TEACHER_TALK_MOVES_HF_MODEL_NAME,
     STUDENT_TALK_MOVES_HF_MODEL_NAME,
-    TEACHER_LAUNCH_FEATURES_2_NL
+    ENGAGEMENT_HF_MODEL_NAME
 )
 
 class Annotator:
@@ -502,4 +503,202 @@ class Annotator:
             df.loc[i, output_column] = total
 
         return df
+    
+    # engagement
+
+    def _get_multilabel_predictions(
+    self,
+    df: pd.DataFrame,
+    text_column: str,
+    model_name: str,
+    min_num_words: int = 0,
+    max_num_words: int | None = None,
+    speaker_column: str | None = None,
+    speaker_value: str | List[str] | None = None,
+) -> pd.DataFrame:
+        """
+        Adds one column per emotion label with the model's sigmoid score.
+
+        Example
+        -------
+        df = annot._get_multilabel_predictions(
+                df, "text", "cardiffnlp/twitter-roberta-base-emotion",
+                speaker_column="speaker", speaker_value="student"
+            )
+        """
+        assert text_column in df.columns, f"{text_column} not found in dataframe"
+
+        if speaker_column is not None:
+            assert speaker_column in df.columns
+            if isinstance(speaker_value, str):
+                speaker_value = [speaker_value]
+
+        tokenizer, model = self._initialize(model_name)
+        label_list = list(model.config.id2label.values())   # keeps label order
+
+        # make empty float columns
+        for lab in label_list:
+            if lab not in df.columns:
+                df[lab] = pd.NA
+
+        model.to("mps")  # or "cuda"/"mps" as appropriate
+
+        with torch.no_grad():
+            for i, row in df.iterrows():
+                if speaker_column and row[speaker_column] not in speaker_value:
+                    continue
+                text = str(row[text_column])
+                if len(text.split()) < min_num_words:
+                    continue
+
+                inputs = tokenizer(
+                    text,
+                    return_tensors="pt",
+                    truncation=True,
+                    padding=True,
+                    max_length=max_num_words,
+                )
+                
+                device = next(model.parameters()).device          # 'cpu', 'cuda', or 'mps'
+                inputs = {k: v.to(device) for k, v in inputs.items()}
+
+                logits = model(**inputs).logits.squeeze(0)        # (num_labels,)
+                probs  = torch.sigmoid(logits).tolist()
+                for lab, p in zip(label_list, probs):
+                    df.at[i, lab] = float(p)
+
+        logging.info(f"Added emotion columns: {', '.join(label_list)}")
+        return df
+    
+    def _affective_engagement(
+            self,
+            row
+    ) -> float:
+        if pd.isna(row["joy"]) or pd.isna(row["optimism"]):
+            return 0
+        return max(row["joy"], row["optimism"])
+
+    def _calc_mark(
+        self,
+        row,
+        speaker_column,
+        speaker_values,
+        event_type_column
+    ) -> float:
+        # The utterance-level components here are:
+        # - number of characters
+        # - boredom index
+        # - math density
+        # - whether or not it was on the whiteboard
+        speaker_values = [speaker_values] if isinstance(speaker_values, str) else speaker_values
+        if row[speaker_column] not in speaker_values:
+            return pd.NA
+        if row[event_type_column] == "whiteboard":
+            return 1
+        math_content = 1 if row["math_density"] > 0 else 0
+        affective = row["affective_engagement"]
+        length_boost = min(row["utterance_size"]/50, 1)
+        return 0.5 + (1/6)*(math_content + affective + length_boost)
+
+    def _hawkes_engagement(
+        self,
+        df,
+        transcript_column,
+        beta=0.05,
+        mu=0
+    ) -> tuple[list[float], list[float]]:
+
+        engagement = np.zeros(len(df))
+        cumulative_engagement = np.zeros(len(df))
+
+        for _, grp in df.groupby(transcript_column, sort=False):
+            idx = grp.index.to_numpy()
+            t = grp["time_secs"].to_numpy(dtype=float)
+            a = grp["mark"].fillna(0.0).to_numpy(dtype=float)
+
+            # pre-compute exponentials once
+            exp_beta_t  = np.exp(beta * t)
+            exp_minus_t = np.exp(-beta * t)
+
+            S = np.cumsum(a * exp_beta_t)
+            A = np.cumsum(a)
+
+            e = mu + exp_minus_t * S
+            E = mu * t + (A - exp_minus_t * S) / beta
+
+            engagement[idx] = e
+            cumulative_engagement[idx] = E
+
+        return engagement.tolist(), cumulative_engagement.tolist()
+
+    def get_engagement(
+        self,
+        df: pd.DataFrame,
+        time_column: str,
+        speaker_column: str,
+        speaker_values: Union[str, List[str]],
+        transcript_column: str = "filename",
+        event_type_column: str = None,
+        text_column: str = None,
+        beta: float = 0.05,
+        output_column: str = "engagement",
+        cumulative_column: str | None = "cumulative_engagement",
+        normalised_column: str | None = "avg_engagement",
+    ) -> pd.DataFrame:
+        # First, convert timestamp to seconds
+        df["time_secs"] = df[time_column].apply(lambda x: pd.to_timedelta(x).total_seconds())
+
+        # Next, get the affective engagement index
+        df = self._get_multilabel_predictions(
+            df,
+            text_column=text_column,
+            model_name=ENGAGEMENT_HF_MODEL_NAME,
+            speaker_column=speaker_column,
+            speaker_value=speaker_values
+        )
+
+        df["affective_engagement"] = df.apply(lambda row: self._affective_engagement(row), axis=1)
+
+        # Then, calculate math density 
+        df = self.get_math_density(
+            df,
+            text_column=text_column,
+            output_column="math_density"
+        )
+
+        # Finally, number of characters per response
+        df["utterance_size"] = df[text_column].apply(lambda x: len(x))
+
+        # Now, we can get the marks
+        df["mark"] = df.apply(
+            lambda row:
+            self._calc_mark(
+                row,
+                speaker_column=speaker_column,
+                speaker_values=speaker_values,
+                event_type_column=event_type_column
+            ),
+            axis=1
+        )
+
+        # Then, we get our hawkes-engagement measures as
+        point_values, cumulative_values = self._hawkes_engagement(
+            df,
+            transcript_column=transcript_column,
+            beta=beta
+        )
+
+        df[[output_column, cumulative_column]] = pd.DataFrame({
+                output_column: point_values,
+                cumulative_column: cumulative_values
+            },
+            index=df.index
+        )
+
+        df[normalised_column] = df[cumulative_column] / df["time_secs"]
+
+        # Finally, we return the df but without the helper columns we made
+        return df.drop(columns=["utterance_size", "mark", "affective_engagement", "math_density"])
+
+
 

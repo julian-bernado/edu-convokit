@@ -62,6 +62,9 @@ FOCUSING_HF_MODEL_NAME = "ddemszky/focusing-questions"
 FOCUSING_MIN_NUM_WORDS = 0
 FOCUSING_MAX_INPUT_LENGTH = 128
 
+# ENGAGEMENT ASSESSMENT
+ENGAGEMENT_HF_MODEL_NAME = "cardiffnlp/twitter-roberta-base-emotion-multilabel-latest"
+
 # MATH DENSITY
 MATH_PREFIXES = [ 
     "sum",
